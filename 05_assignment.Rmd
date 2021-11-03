@@ -1,0 +1,418 @@
+---
+title: 'Assignment #5'
+author: 'Mia Rothberg'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_download: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r libraries}
+# SEE modeldata package for new datasets
+library(tidyverse)         # for graphing and data cleaning
+library(tidymodels)        # for modeling
+library(ranger)            # for random forest - will need for shiny app
+library(lubridate)         # for date manipulation
+library(themis)            # for up and downsampling
+library(DALEX)             # for model interpretation  
+library(DALEXtra)          # for extension of DALEX
+theme_set(theme_minimal()) # Lisa's favorite theme
+```
+
+```{r data}
+data("lending_club")
+# Data dictionary (as close as I could find): https://www.kaggle.com/wordsforthewise/lending-club/discussion/170691
+```
+
+
+When you finish the assignment, remove the `#` from the options chunk at the top, so that messages and warnings aren't printed. If you are getting errors in your code, add `error = TRUE` so that the file knits. I would recommend not removing the `#` until you are completely finished.
+
+## Put it on GitHub!        
+
+From now on, GitHub should be part of your routine when doing assignments. I recommend making it part of your process anytime you are working in R, but I'll make you show it's part of your process for assignments.
+
+**Task**: When you are finished with the assignment, post a link below to the GitHub repo for the assignment. Make sure the link goes to a spot in the repo where I can easily find this assignment. For example, if you have a website with a blog and post the assignment as a blog post, link to the post's folder in the repo. As an example, I've linked to my GitHub stacking material [here](https://github.com/llendway/ads_website/tree/master/_posts/2021-03-22-stacking).
+
+> [Github Link](https://github.com/miarothberg/assignment_05_110421)
+
+## Interpretable ML methods
+
+We will once again use the lending club data that we used in the 3rd assignment. We will focus on the random forest model, which I recreate below. (Note we use this model even though the true negative rate of the training set is quite bad.)
+
+```{r}
+set.seed(494) # for reproducibility
+
+#split data
+lending_split <- initial_split(lending_club,
+                               prop = .75,
+                               strata = Class)
+
+lending_training <- training(lending_split)
+lending_test <- testing(lending_split)
+
+
+#create recipe - including up and downsampling for model fitting
+set.seed(456)
+rf_recipe <- 
+  recipe(Class ~ .,
+         data = lending_training) %>% 
+  step_upsample(Class, over_ratio = .5) %>% 
+  step_downsample(Class, under_ratio = 1) %>% 
+  step_mutate_at(all_numeric(), 
+                 fn = ~as.numeric(.))
+
+# create model
+rf_model <- 
+  rand_forest(mtry = tune(), 
+              min_n = tune(), 
+              trees = 100) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger")
+
+# create workflow
+rf_workflow <-
+  workflow() %>% 
+  add_recipe(rf_recipe) %>% 
+  add_model(rf_model)
+
+  grid_regular(finalize(mtry(),
+                        lending_training %>%
+                          select(-Class)),
+               min_n(),
+               levels = 3)
+
+# create penalty grid
+  rf_penalty_grid <- 
+grid_regular(finalize(mtry(),
+                        lending_training %>%
+                          select(-Class)),
+               min_n(),
+               levels = 3)
+
+
+# create cv samples
+set.seed(494) #for reproducible 5-fold
+lending_cv <- vfold_cv(lending_training,
+                       v = 5)
+
+# tune model
+rf_tune <- 
+  rf_workflow %>% 
+  tune_grid(
+    resamples = lending_cv,
+    grid = rf_penalty_grid
+  )
+
+# find model with best accuracy
+best_accuracy <-
+  rf_tune %>% 
+  select_best(metric = "accuracy")
+
+# finalize model
+rf_final <- rf_workflow %>% 
+  finalize_workflow(best_accuracy) %>% 
+  fit(data = lending_training)
+```
+
+1. Use functions from the `DALEX` and `DALEXtra` libraries to create a histogram and boxplot of the residuals from the training data. How do they look? Any interesting behavior?
+
+```{r}
+rf_explain <- 
+  explain_tidymodels(
+    model = rf_final,
+    data = lending_training %>% select(-Class), #training data without response variable 
+    y = lending_training %>% 
+      mutate(Class_num = as.integer(Class =="good")) %>% 
+      pull(Class_num),
+    label = "rf"
+  )
+```
+
+
+```{r}
+rf_mod_perf <- model_performance(rf_explain)
+
+hist_plot <- 
+  plot(rf_mod_perf, 
+       geom = "histogram")
+
+box_plot <-
+  plot(rf_mod_perf, 
+       geom = "boxplot")
+
+hist_plot 
+box_plot
+```
+
+> The histogram shows that the residuals are very right skewed.The median is around 0.06, and the root mean square of the residuals is around 0.15.
+
+2. Use `DALEX` functions to create a variable importance plot from this model. What are the most important variables? 
+
+```{r}
+set.seed(10) #since we are sampling & permuting, we set a seed so we can replicate the results
+rf_var_imp <- 
+  model_parts(
+    rf_explain
+    )
+
+plot(rf_var_imp, show_boxplots = TRUE)
+
+```
+
+> The five most imporant variables are `int_rate` (interest rate on the loan), `sub_grade` (LC assigned loan subgrade), `open_il_24m` (number of installment accounts opened in the past 24 months), `annual_inc` (The self-reported annual income provided by the borrower during registration), and `addr_state` (The state provided by the borrower in the loan application).
+
+3. Write a function called `cp_profile` to make a CP profile. The function will take an explainer, a new observation, and a variable name as its arguments and create a CP profile for a quantitative predictor variable. You will need to use the `predict_profile()` function inside the function you create - put the variable name there so the plotting part is easier. You'll also want to use `.data[[]]` rather than `aes()` and quote the variables. Use the `cp_profile()` function to create one CP profile of your choosing. Be sure to choose a variable that is numeric, not integer. There seem to be issues with those that I'm looking into.
+
+```{r}
+obs4 <- lending_training %>% 
+  slice(4)
+
+cp_profile <- function(explainer, new_obs, variable){
+  rf_cpp <- predict_profile(explainer = explainer, 
+                          variables = variable,
+                          new_observation = new_obs) 
+  
+plot <- rf_cpp %>% 
+  filter(`_vname_` %in% c(variable)) %>% 
+  ggplot(aes(x = .data[[variable]],
+             y = `_yhat_`)) +
+  geom_line() 
+return(plot)
+}
+
+cp_profile(rf_explain, obs4, "int_rate")
+```
+
+
+For an extra challenge, write a function that will work for either a quantitative or categorical variable. 
+
+If you need help with function writing check out the [Functions](https://r4ds.had.co.nz/functions.html) chapter of R4DS by Wickham and Grolemund.
+
+4. Use `DALEX` functions to create partial dependence plots (with the CP profiles in gray) for the 3-4 most important variables. If the important variables are categorical, you can instead make a CP profile for 3 observations in the dataset and discuss how you could go about constructing a partial dependence plot for a categorical variable (you don't have to code it, but you can if you want an extra challenge). If it ever gives you an error that says, "Error: Can't convert from `VARIABLE` <double> to `VARIABLE` <integer> due to loss of precision", then remove that variable from the list. I seem to have figured out why it's doing that, but I don't know how to fix it yet.
+
+```{r}
+set.seed(494) # since we take a sample of 100 obs
+# PUT 3-4 most important variables in instead of sqft-living
+rf_pdp1 <- model_profile(explainer = rf_explain, 
+                        variables = c("int_rate"))
+
+plot(rf_pdp1, 
+     variables = "int_rate",
+     geom = "profiles")
+
+rf_pdp2 <- model_profile(explainer = rf_explain, 
+                        variables = c("open_il_24m"))
+
+plot(rf_pdp2, 
+     variables = "open_il_24m",
+     geom = "profiles")
+
+rf_pdp3 <- model_profile(explainer = rf_explain, 
+                        variables = c("open_il_24m"))
+
+plot(rf_pdp3, 
+     variables = "open_il_24m",
+     geom = "profiles")
+```
+
+
+5. Choose 3 observations and do the following for each observation:  
+  - Construct a break-down plot using the default ordering. Interpret the resulting graph. Which variables contribute most to each observation's prediction?  
+  
+```{r}
+# Pulls together the data needed for the break-down plot
+pp_lasso <- predict_parts(explainer = rf_explain,
+                          new_observation = obs4,
+                          type = "break_down") #default
+
+# Break-down plot
+plot(pp_lasso)
+
+# Table form of break-down plot data
+pp_lasso
+```
+> For observation #4, int_rate, annual_inc, and state contribute most (positively), and total_il_high_credit_limit subtracts the most.
+
+```{r}
+obs7000 <- lending_training %>% 
+  slice(7000)
+
+# Pulls together the data needed for the break-down plot
+pp_lasso <- predict_parts(explainer = rf_explain,
+                          new_observation = obs7000,
+                          type = "break_down") #default
+
+# Break-down plot
+plot(pp_lasso)
+
+# Table form of break-down plot data
+pp_lasso
+```
+> For observation #7000, int_rate, total_bal_il, and sub_grade contribute the most positively, and state subtracts the most.
+
+```{r}
+obs3000 <- lending_training %>% 
+  slice(3000)
+
+# Pulls together the data needed for the break-down plot
+pp_lasso <- predict_parts(explainer = rf_explain,
+                          new_observation = obs3000,
+                          type = "break_down") #default
+
+# Break-down plot
+plot(pp_lasso)
+
+# Table form of break-down plot data
+pp_lasso
+```
+
+> For observation #3000, inq_last_12m and funded_amnt contributed the most. All other variables either added or subtracted <0.02.
+  
+  - Construct a SHAP graph and interpret it. Does it tell a similar story to the break-down plot?  
+  
+```{r}
+rf_shap1 <-predict_parts(explainer = rf_explain,
+                        new_observation = obs4,
+                        type = "shap",
+                        B = 10 #number of reorderings - start small
+)
+
+plot(rf_shap1)
+```
+
+> Break Down: For observation #4, int_rate, annual_inc, and state contribute most (positively), and total_il_high_credit_limit subtracts the most. The SHAP graph shows the same variables as important, with the additional inclusion of emp_length.
+  
+
+```{r}
+rf_shap2 <-predict_parts(explainer = rf_explain,
+                        new_observation = obs3000,
+                        type = "shap",
+                        B = 10 #number of reorderings - start small
+)
+
+plot(rf_shap2)
+
+rf_shap3 <-predict_parts(explainer = rf_explain,
+                        new_observation = obs7000,
+                        type = "shap",
+                        B = 10 #number of reorderings - start small
+)
+
+plot(rf_shap3)
+```
+
+> Break Down: For observation #3000, inq_last_12m and funded_amnt contributed the most. All other variables either added or subtracted <0.02. The SHAP graph tells the same story.
+
+> Break Down: For observation #7000, int_rate, total_bal_il, and sub_grade contribute the most positively, and state subtracts the most. The SHAP graph is similar, but shows all_util as second most important and open_il_24m as more important than sub_grade.
+
+
+  - Construct a LIME graph (follow my code carefully). How close is each original prediction to the prediction from the local model? Interpret the result. You can also try using fewer or more variables in the local model than I used in the example.  
+  
+```{r}
+set.seed(2)
+
+# NEED these two lines of code always!
+# They make sure our explainer is defined correctly to use in the next step
+model_type.dalex_explainer <- DALEXtra::model_type.dalex_explainer
+predict_model.dalex_explainer <- DALEXtra::predict_model.dalex_explainer
+
+lime_rf1 <- predict_surrogate(explainer = rf_explain,
+                             new_observation = obs4 %>%
+                               select(-Class), 
+                             n_features = 10,
+                             n_permutations = 1000,
+                             type = "lime")
+
+lime_rf1 %>% 
+  select(model_r2, model_prediction, prediction) %>% 
+  distinct()
+
+plot(lime_rf1) +
+  labs(x = "Variable")
+
+lime_rf2 <- predict_surrogate(explainer = rf_explain,
+                             new_observation = obs3000 %>%
+                               select(-Class), 
+                             n_features = 10,
+                             n_permutations = 1000,
+                             type = "lime")
+
+lime_rf2 %>% 
+  select(model_r2, model_prediction, prediction) %>% 
+  distinct()
+
+plot(lime_rf2) +
+  labs(x = "Variable")
+
+lime_rf3 <- predict_surrogate(explainer = rf_explain,
+                             new_observation = obs7000 %>%
+                               select(-Class), 
+                             n_features = 10,
+                             n_permutations = 1000,
+                             type = "lime")
+
+lime_rf3 %>% 
+  select(model_r2, model_prediction, prediction) %>% 
+  distinct()
+
+plot(lime_rf3) +
+  labs(x = "Variable")
+```
+
+> Observation 4: the original prediction is 0.08 higher than the local model prediction. Either way, the model would predict `Class` as "good."
+
+> Observation 3000: the original prediction is 0.15 higher than the local model prediction. Either way, the model would predict `Class` as "good."
+
+> Observation 7000: the original prediction is 0.15 higher than the local model prediction. Either way, the model would predict `Class` as "good." The model_r2 in all cases is very low (<0.1). 
+  
+6. Describe how you would use the interpretable machine learning tools we've learned (both local and global) in future machine learning projects? How does each of them help you?
+
+> Global model interpretations will help to understand the overall relationships between the predictor and response variables, and local model interpretations will help to understand the impact of predictors on individual observations. They could both be used in future machine learning projects to help understand complicated models.
+
+7. Save this final model using the write_rds() function - see the Use the model section of the tidymodels intro for a similar example, but we’re using write_rds() instead of saveRDS(). We are going to use the model in the next part. You’ll want to save it in the folder where you create your shiny app. Run the code, and then add eval=FALSE to the code chunk options (next to the r inside the curly brackets) so it doesn’t rerun this each time you knit.
+
+```{r}
+write_rds(rf_final, "lending_rf_final.rds")
+```
+
+
+
+## Shiny app
+
+You are going to create an app that allows a user to explore how the predicted probability of a loan being paid back (or maybe just the predicted class - either “good” or “bad”) changes depending on the values of the predictor variables.
+
+Specifically, you will do the following:
+
+* Set up a separate project and GitHub repo for this app. Make sure the saved model from the previous problem is also in that folder. The app needs to be created in a file called exactly app.R that is also in the project folder.
+* At the top of the file, load any libraries you use in the app.
+* Use the read_rds() function to load the model.
+* You may want to load some of the lending data to use to help in the design of your app. The original data are in tidymodels which you will also have to load in the shiny app.
+* Create a user interface (using the various *Input() functions) where someone could enter values for each variable that feeds into the model. You will want to think hard about which types of *Input() functions to use. Think about how you can best prevent mistakes (eg. entering free text could lead to many mistakes). I’d recommend using sliders and drop-downs as often as possible.
+* Another part of the user interface will allow them to choose a variable (you can limit this to only the quantitative variables) where they can explore the effects of changing that variable, holding all others constant.
+* After the user has entered all the required values, the output will be a CP profile with the the predicted value for the data that was entered, indicated by a point. You may be able to use the functions from DALEX and DALEXtra or you can do some of your own coding.
+* Use the bslib to theme your shiny app!
+* Publish your app to shinyapps.io. There are instructions for doing that on my tutorial page from Intro Data Science: https://animation-and-interactivity-in-r.netlify.app/#publishing-your-app. Make sure to load ALL the libraries that you use at the top of your file. This includes the ranger library, which is used “behind the scenes” when your model is fit. If you try to publish and are unsuccessful, forgetting a library you need is the most common reason I have seen.
+* Write a paragraph or two describing your app on your website! Link to the app and your GitHub repository in your post. Include a link to your post here.
+
+> App available on my website: mia-rothberg.netlify.app
+
+## Data Ethics: Data visualization principles
+
+I'm hoping that the topic for this week is a review for all of you, but it's good to remind ourselves of these principles.  
+
+**Task:**
+
+Read both short articles in Week6. Data visualization section of [Calling Bulllshit](https://www.callingbullshit.org/syllabus.html#Visual). Were there any principles mentioned that you hadn't heard of before? What graph stood out for you as "the worst"? Did any of the graphs fool you? Or were able to overcome the bad practices (don't worry if they fool you - plently of them have fooled me, too.)? How does practicing good data visualization principles fit in with data ethics?
+
+> While I had never explicitly heard of several of the principles mentioned, the ideas of of when axes should and should not go to 0 and proportional shading aren't new to me. I've seen the graph on gun deaths in Florida with the inverted y-axis before, but it never fails to surprise me and definitely seems like the worst. It was interesting to learn that the creator of the graph did it that way because they viewed deaths as negative, rather than because they were intentionally trying to mislead people. Practicing good data visualization is important for data ethics because it ensures that data is not being misrepresented or being presented in a misleading way.
+
+
+## Make this document look nicer!
+
+Go to the top and delete the `#` from the options section and knit a final time.
